@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Thumbnail Generator with API Gateway, Lambda, and CloudFront'
+
+Parameters:
+  SourceBucketName:
+    Type: String
+    Description: S3 bucket name for source images
+  
+  SecretKey:
+    Type: String
+    Description: Secret key for CloudFront to API Gateway authentication
+    NoEcho: true
+    MinLength: 32
+  
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment package
+  
+  LambdaCodeKey:
+    Type: String
+    Description: S3 key for Lambda deployment package (function-with-deps.zip)
+    Default: lambda/function.zip
+
+Resources:
+  # IAM Role for Lambda
+  ThumbnailLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadOnlySpecificBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SourceBucketName}'
+                  - !Sub 'arn:aws:s3:::${SourceBucketName}/*'
+      Tags:
+        - Key: Project
+          Value: ThumbnailGenerator
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Function
+  ThumbnailFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ThumbnailLambdaRole
+    Properties:
+      FunctionName: thumbnail-generator
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt ThumbnailLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref SourceBucketName
+          SECRET_KEY: !Ref SecretKey
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Tags:
+        - Key: Project
+          Value: ThumbnailGenerator
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # API Gateway REST API
+  ThumbnailApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: thumbnail-api
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      BinaryMediaTypes:
+        - '*/*'
+      Tags:
+        - Key: Project
+          Value: ThumbnailGenerator
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # API Gateway Resource (proxy+)
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: ThumbnailApi
+    Properties:
+      RestApiId: !Ref ThumbnailApi
+      ParentId: !GetAtt ThumbnailApi.RootResourceId
+      PathPart: '{proxy+}'
+
+  # API Gateway Method (ANY)
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: ProxyResource
+    Properties:
+      RestApiId: !Ref ThumbnailApi
+      ResourceId: !Ref ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ThumbnailFunction.Arn}/invocations'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ProxyMethod
+    Properties:
+      RestApiId: !Ref ThumbnailApi
+      StageName: prod
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ThumbnailFunction
+      - ThumbnailApi
+    Properties:
+      FunctionName: !Ref ThumbnailFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ThumbnailApi}/*/*'
+
+  # CloudFront Response Headers Policy
+  ThumbnailResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: ThumbnailSecurityHeaders
+        Comment: Security headers for thumbnail service
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Protection: true
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+
+  # CloudFront Cache Policy
+  ThumbnailCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: ThumbnailCachePolicy
+        Comment: Cache policy for thumbnail generation
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          QueryStringsConfig:
+            QueryStringBehavior: whitelist
+            QueryStrings:
+              - width
+              - height
+              - format
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+
+  # CloudFront Origin Request Policy
+  ThumbnailOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: ThumbnailOriginRequestPolicy
+        Comment: Origin request policy for thumbnail API
+        QueryStringsConfig:
+          QueryStringBehavior: whitelist
+          QueryStrings:
+            - width
+            - height
+            - format
+        HeadersConfig:
+          HeaderBehavior: none
+        CookiesConfig:
+          CookieBehavior: none
+
+  # CloudFront Distribution
+  ThumbnailDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - ThumbnailCachePolicy
+      - ThumbnailOriginRequestPolicy
+      - ThumbnailResponseHeadersPolicy
+      - ThumbnailApi
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Thumbnail generator distribution
+        Origins:
+          - Id: thumbnail-api
+            DomainName: !Sub '${ThumbnailApi}.execute-api.${AWS::Region}.amazonaws.com'
+            OriginPath: /prod
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref SecretKey
+        DefaultCacheBehavior:
+          TargetOriginId: thumbnail-api
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: !Ref ThumbnailCachePolicy
+          OriginRequestPolicyId: !Ref ThumbnailOriginRequestPolicy
+          ResponseHeadersPolicyId: !Ref ThumbnailResponseHeadersPolicy
+        PriceClass: PriceClass_100
+      Tags:
+        - Key: Project
+          Value: ThumbnailGenerator
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ThumbnailApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  
+  CloudFrontDomain:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt ThumbnailDistribution.DomainName
+  
+  CloudFrontURL:
+    Description: CloudFront distribution URL
+    Value: !Sub 'https://${ThumbnailDistribution.DomainName}'
+  
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt ThumbnailFunction.Arn
+
