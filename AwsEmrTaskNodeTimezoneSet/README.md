@@ -1,2 +1,1 @@
-# AWS
-This repository contains some codes about AWS resources.
+Automatically set AWS EMR task node time zone.
