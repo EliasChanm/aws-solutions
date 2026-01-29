@@ -1,0 +1,693 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Moltbot - AWS Native Deployment (Bedrock + SSM + VPC Endpoints)'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - MoltbotModel
+          - InstanceType
+          - KeyPairName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - CreateVPCEndpoints
+          - AllowedSSHCIDR
+      - Label:
+          default: "Advanced Configuration"
+        Parameters:
+          - EnableSandbox
+
+Parameters:
+  MoltbotModel:
+    Type: String
+    Default: "us.anthropic.claude-opus-4-20250514-v1:0"
+    Description: "Bedrock inference profile ID (must use us./eu./apac. prefix)"
+
+  InstanceType:
+    Type: String
+    Default: "t3.medium"
+    AllowedValues:
+      - "t3.small"
+      - "t3.medium"
+      - "t3.large"
+      - "t3.xlarge"
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "EC2 key pair for emergency SSH access"
+
+  AllowedSSHCIDR:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: "CIDR for SSH access (recommend SSM Session Manager, set to 127.0.0.1/32 to disable SSH)"
+
+  CreateVPCEndpoints:
+    Type: String
+    Default: "true"
+    Description: "Create VPC endpoints for private network access to Bedrock and SSM"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  EnableSandbox:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Conditions:
+  CreateEndpoints: !Equals [!Ref CreateVPCEndpoints, "true"]
+  AllowSSH: !Not [!Equals [!Ref AllowedSSHCIDR, "127.0.0.1/32"]]
+
+Resources:
+  # ==================== Wait Condition ====================
+  MoltbotWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  MoltbotWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: MoltbotInstance
+    Properties:
+      Handle: !Ref MoltbotWaitHandle
+      Timeout: '900'
+      Count: 1
+
+  # ==================== VPC and Network ====================
+  MoltbotVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  MoltbotInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MoltbotVPC
+      InternetGatewayId: !Ref MoltbotInternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MoltbotVPC
+      CidrBlock: "10.0.1.0/24"
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-subnet"
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MoltbotVPC
+      CidrBlock: "10.0.2.0/24"
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-subnet"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MoltbotVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref MoltbotInternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # VPC Endpoint Security Group
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateEndpoints
+    Properties:
+      GroupDescription: "Security group for VPC endpoints"
+      VpcId: !Ref MoltbotVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref MoltbotSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpce-sg"
+
+  # Bedrock Runtime VPC Endpoint
+  BedrockRuntimeVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref MoltbotVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-runtime'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # SSM VPC Endpoint (for Session Manager)
+  SSMVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref MoltbotVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMMessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref MoltbotVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EC2MessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref MoltbotVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # ==================== IAM Role ====================
+  MoltbotInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Policies:
+        - PolicyName: BedrockAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                  - 'bedrock:ListFoundationModels'
+                  - 'bedrock:GetFoundationModel'
+                Resource: '*'
+        - PolicyName: SSMParameterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:PutParameter'
+                  - 'ssm:GetParameter'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/moltbot/${AWS::StackName}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance-role"
+
+  MoltbotInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref MoltbotInstanceRole
+
+  # ==================== Security Group ====================
+  MoltbotSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Moltbot instance security group"
+      VpcId: !Ref MoltbotVPC
+      SecurityGroupIngress:
+        - !If
+          - AllowSSH
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref AllowedSSHCIDR
+            Description: "SSH access (fallback)"
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # ==================== EC2 Instance ====================
+  MoltbotInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref MoltbotInstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref MoltbotSecurityGroup
+          SubnetId: !Ref PublicSubnet
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e  # Exit on error
+          
+          exec > >(tee /var/log/moltbot-setup.log)
+          exec 2>&1
+          
+          echo "=========================================="
+          echo "Moltbot AWS Native Setup: $(date)"
+          echo "=========================================="
+          
+          export DEBIAN_FRONTEND=noninteractive
+          
+          # Function to send failure signal
+          send_failure() {
+            local reason="$1"
+            echo "FATAL ERROR: $reason"
+            
+            # Try to install cfn-signal if not available
+            if ! command -v cfn-signal &> /dev/null; then
+              apt-get install -y python3-pip 2>/dev/null || true
+              pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz 2>/dev/null || true
+            fi
+            
+            CFN_SIGNAL=$(which cfn-signal 2>/dev/null || find /usr -name cfn-signal 2>/dev/null | head -1)
+            
+            if [ -n "$CFN_SIGNAL" ]; then
+              $CFN_SIGNAL -e 1 -r "$reason" '${MoltbotWaitHandle}'
+            else
+              SIGNAL_JSON="{\"Status\":\"FAILURE\",\"Reason\":\"$reason\",\"UniqueId\":\"moltbot\",\"Data\":\"\"}"
+              curl -X PUT -H 'Content-Type:' --data-binary "$SIGNAL_JSON" '${MoltbotWaitHandle}' 2>/dev/null || true
+            fi
+            
+            exit 1
+          }
+          
+          # Trap errors
+          trap 'send_failure "Script failed at line $LINENO"' ERR
+          
+          # Get metadata once at the beginning
+          echo "[0/9] Fetching instance metadata..."
+          TOKEN_IMDS=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+          if [ -n "$TOKEN_IMDS" ]; then
+            AWS_REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN_IMDS" -s http://169.254.169.254/latest/meta-data/placement/region)
+            INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN_IMDS" -s http://169.254.169.254/latest/meta-data/instance-id)
+          else
+            AWS_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          fi
+          
+          # Fallback
+          AWS_REGION=${!AWS_REGION:-"${AWS::Region}"}
+          INSTANCE_ID=${!INSTANCE_ID:-"unknown"}
+          
+          echo "Region: $AWS_REGION"
+          echo "Instance ID: $INSTANCE_ID"
+          
+          # System update
+          echo "[1/9] Updating system..."
+          apt-get update || send_failure "apt-get update failed"
+          apt-get upgrade -y
+          apt-get install -y unzip curl python3-pip
+          
+          # Install AWS CLI v2
+          echo "[2/9] Installing AWS CLI..."
+          for i in {1..3}; do
+            if curl --connect-timeout 10 --max-time 300 \
+              "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"; then
+              break
+            fi
+            echo "AWS CLI download failed, retrying $i/3..."
+            sleep 5
+          done
+          
+          [ -f "awscliv2.zip" ] || send_failure "Failed to download AWS CLI"
+          unzip -q awscliv2.zip
+          ./aws/install || send_failure "AWS CLI installation failed"
+          rm -rf aws awscliv2.zip
+          
+          # Install SSM Agent
+          echo "[3/9] Configuring SSM Agent..."
+          snap start amazon-ssm-agent || systemctl start amazon-ssm-agent || true
+          
+          # Install Node.js
+          echo "[4/9] Installing Node.js..."
+          sudo -u ubuntu bash << 'UBUNTU_SCRIPT'
+          set -e
+          cd ~
+          
+          # Install NVM (with retry)
+          for i in {1..3}; do
+            if curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash; then
+              break
+            fi
+            echo "NVM installation failed, retrying $i/3..."
+            sleep 5
+          done
+          
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" || exit 1
+          
+          # Install Node.js 22
+          nvm install 22 || exit 1
+          nvm use 22
+          nvm alias default 22
+          
+          # Verify Node.js
+          node --version || exit 1
+          npm --version || exit 1
+          
+          # Install Moltbot (with timeout and retry)
+          echo "Installing Moltbot..."
+          npm config set registry https://registry.npmjs.org/
+          npm install -g clawdbot@latest --timeout=300000 || {
+            echo "Moltbot installation failed, retrying..."
+            npm cache clean --force
+            npm install -g clawdbot@latest --timeout=300000 || exit 1
+          }
+          
+          # Verify Moltbot installation
+          if command -v clawdbot &> /dev/null; then
+            echo "✓ Moltbot installed successfully"
+            clawdbot --version || echo "Warning: version check failed but command exists"
+          else
+            echo "ERROR: moltbot command not found after installation"
+            exit 1
+          fi
+          
+          if ! grep -q 'NVM_DIR' ~/.bashrc; then
+              echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.bashrc
+              echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' >> ~/.bashrc
+          fi
+          UBUNTU_SCRIPT
+          
+          [ $? -eq 0 ] || send_failure "Node.js/Moltbot installation failed"
+          
+          # Configure AWS
+          echo "[5/10] Configuring AWS..."
+          sudo -u ubuntu aws configure set region "$AWS_REGION"
+          sudo -u ubuntu aws configure set output json
+          
+          # Configure environment variables
+          echo "[6/10] Configuring environment variables..."
+          cat >> /home/ubuntu/.bashrc << EOF
+          export AWS_REGION=$AWS_REGION
+          export AWS_DEFAULT_REGION=$AWS_REGION
+          export AWS_PROFILE=default
+          export MOLTBOT_MODEL="${MoltbotModel}"
+          export MOLTBOT_USE_BEDROCK=true
+          EOF
+          
+          # Enable systemd linger
+          echo "[7/10] Configuring systemd..."
+          loginctl enable-linger ubuntu
+          systemctl start user@1000.service
+          sleep 3  # Wait for user service to start
+          
+          # Configure Moltbot
+          echo "[8/10] Configuring Moltbot..."
+          sudo -u ubuntu mkdir -p /home/ubuntu/.clawdbot
+          
+          # Generate Gateway Token
+          GATEWAY_TOKEN=$(openssl rand -hex 24)
+          
+          # Create Bedrock configuration file
+          sudo -u ubuntu cat > /home/ubuntu/.clawdbot/clawdbot.json << JSONEOF
+          {
+            "gateway": {
+              "mode": "local",
+              "port": 18789,
+              "bind": "loopback",
+              "controlUi": {
+                "enabled": true,
+                "allowInsecureAuth": true
+              },
+              "auth": {
+                "mode": "token",
+                "token": "$GATEWAY_TOKEN"
+              }
+            },
+            "models": {
+              "bedrockDiscovery": {
+                "enabled": true,
+                "region": "$AWS_REGION",
+                "providerFilter": ["anthropic", "amazon"],
+                "refreshInterval": 3600,
+                "defaultContextWindow": 200000,
+                "defaultMaxTokens": 8192
+              },
+              "providers": {
+                "amazon-bedrock": {
+                  "baseUrl": "https://bedrock-runtime.$AWS_REGION.amazonaws.com",
+                  "api": "bedrock-converse-stream",
+                  "auth": "aws-sdk",
+                  "models": [
+                    {
+                      "id": "${MoltbotModel}",
+                      "name": "Primary Model",
+                      "input": ["text", "image"],
+                      "contextWindow": 200000,
+                      "maxTokens": 8192
+                    }
+                  ]
+                }
+              }
+            },
+            "agents": {
+              "defaults": {
+                "model": {
+                  "primary": "amazon-bedrock/${MoltbotModel}"
+                }
+              }
+            }
+          }
+          JSONEOF
+          
+          # Install daemon
+          echo "Installing Moltbot daemon..."
+          sudo -H -u ubuntu XDG_RUNTIME_DIR=/run/user/1000 bash -c '
+          export HOME=/home/ubuntu
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" || exit 1
+          
+          if ! command -v clawdbot &> /dev/null; then
+            echo "ERROR: clawdbot command not found"
+            exit 1
+          fi
+          
+          clawdbot daemon install || exit 1
+          '
+          
+          [ $? -eq 0 ] || send_failure "Moltbot daemon installation failed"
+          
+          # Wait for service to start
+          echo "Waiting for service to start..."
+          sleep 10
+          
+          # Verify service is running
+          if ! sudo -u ubuntu XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active clawdbot-gateway.service; then
+            echo "Service check failed. Checking status..."
+            sudo -u ubuntu XDG_RUNTIME_DIR=/run/user/1000 systemctl --user status clawdbot-gateway.service || true
+            send_failure "Clawdbot gateway service failed to start"
+          fi
+          
+          echo "✓ Clawdbot gateway service is running"
+          
+          # Save token
+          echo "$GATEWAY_TOKEN" > /home/ubuntu/.clawdbot/gateway_token.txt
+          chown ubuntu:ubuntu /home/ubuntu/.clawdbot/gateway_token.txt
+          
+          # Save to SSM Parameter Store
+          STACK_NAME="${AWS::StackName}"
+          aws ssm put-parameter \
+            --name "/moltbot/$STACK_NAME/gateway-token" \
+            --value "$GATEWAY_TOKEN" \
+            --type "SecureString" \
+            --region $AWS_REGION \
+            --overwrite || send_failure "Failed to save token to SSM"
+          
+          # Save instance info
+          echo "$INSTANCE_ID" > /home/ubuntu/.clawdbot/instance_id.txt
+          echo "$AWS_REGION" > /home/ubuntu/.clawdbot/region.txt
+          
+          # Create access instructions
+          cat > /home/ubuntu/ACCESS_INSTRUCTIONS.txt << EOF
+          Moltbot Access Instructions
+          ========================================
+          
+          Run on your LOCAL computer:
+          
+          aws ssm start-session \\
+            --target $INSTANCE_ID \\
+            --region $AWS_REGION \\
+            --document-name AWS-StartPortForwardingSession \\
+            --parameters '{"portNumber":["18789"],"localPortNumber":["18789"]}'
+          
+          Then open in browser:
+          http://localhost:18789/?token=$GATEWAY_TOKEN
+          
+          ========================================
+          EOF
+          chown ubuntu:ubuntu /home/ubuntu/ACCESS_INSTRUCTIONS.txt
+          
+          # Create SSM access script
+          cat > /home/ubuntu/ssm-portforward.sh << 'EOF'
+          #!/bin/bash
+          INSTANCE_ID=$(cat /home/ubuntu/.clawdbot/instance_id.txt)
+          REGION=$(cat /home/ubuntu/.clawdbot/region.txt)
+          TOKEN=$(cat /home/ubuntu/.clawdbot/gateway_token.txt)
+          
+          echo "=========================================="
+          echo "Moltbot SSM Port Forwarding"
+          echo "=========================================="
+          echo ""
+          echo "Run on your local computer:"
+          echo ""
+          echo "aws ssm start-session \\"
+          echo "  --target $INSTANCE_ID \\"
+          echo "  --region $REGION \\"
+          echo "  --document-name AWS-StartPortForwardingSession \\"
+          echo "  --parameters '{\"portNumber\":[\"18789\"],\"localPortNumber\":[\"18789\"]}'"
+          echo ""
+          echo "Then open in browser:"
+          echo "http://localhost:18789/?token=$TOKEN"
+          echo ""
+          echo "=========================================="
+          EOF
+          chmod +x /home/ubuntu/ssm-portforward.sh
+          chown ubuntu:ubuntu /home/ubuntu/ssm-portforward.sh
+          
+          # Mark as complete
+          echo "[9/9] Complete!"
+          echo "SUCCESS" > /home/ubuntu/.clawdbot/setup_status.txt
+          echo "Setup completed: $(date)" >> /home/ubuntu/.clawdbot/setup_status.txt
+          
+          # Install cfn-bootstrap tools
+          echo "Installing cfn-bootstrap..."
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz || {
+            echo "Warning: cfn-bootstrap installation failed, trying alternative..."
+            pip3 install --upgrade pip || true
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz || true
+          }
+          
+          # Find cfn-signal
+          CFN_SIGNAL=$(which cfn-signal 2>/dev/null || find /usr/local -name cfn-signal 2>/dev/null | head -1)
+          
+          # Create complete URL
+          COMPLETE_URL="http://localhost:18789/?token=$GATEWAY_TOKEN"
+          
+          # Signal CloudFormation
+          if [ -n "$CFN_SIGNAL" ]; then
+            echo "Signaling success to CloudFormation..."
+            $CFN_SIGNAL -e 0 -d "$COMPLETE_URL" -r "Moltbot ready" '${MoltbotWaitHandle}' || {
+              echo "cfn-signal failed, using curl fallback..."
+              SIGNAL_JSON="{\"Status\":\"SUCCESS\",\"Reason\":\"Moltbot ready\",\"UniqueId\":\"moltbot\",\"Data\":\"$COMPLETE_URL\"}"
+              curl -X PUT -H 'Content-Type:' --data-binary "$SIGNAL_JSON" '${MoltbotWaitHandle}'
+            }
+          else
+            echo "Using curl to signal CloudFormation..."
+            SIGNAL_JSON="{\"Status\":\"SUCCESS\",\"Reason\":\"Moltbot ready\",\"UniqueId\":\"moltbot\",\"Data\":\"$COMPLETE_URL\"}"
+            curl -X PUT -H 'Content-Type:' --data-binary "$SIGNAL_JSON" '${MoltbotWaitHandle}'
+          fi
+          
+          echo "=========================================="
+          echo "Moltbot installation complete!"
+          echo "Access URL: $COMPLETE_URL"
+          echo "=========================================="
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+
+Outputs:
+  Step1InstallSSMPlugin:
+    Description: "STEP 1: Install SSM Session Manager Plugin on your local computer"
+    Value: "https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+
+  Step2PortForwarding:
+    Description: "STEP 2: Run this command on LOCAL computer (keep terminal open)"
+    Value: !Sub |
+      aws ssm start-session --target ${MoltbotInstance} --region ${AWS::Region} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["18789"],"localPortNumber":["18789"]}'
+
+  Step3AccessURL:
+    Description: "STEP 3: Open this URL in browser"
+    Value: !Select 
+      - 1
+      - !Split 
+        - '":"'
+        - !Select 
+          - 0
+          - !Split 
+            - '"}'
+            - !GetAtt MoltbotWaitCondition.Data
+
+  Step4StartChatting:
+    Description: "STEP 4: Start using Moltbot!"
+    Value: "Connect WhatsApp, Telegram, Discord. See README: https://github.com/aws-samples/sample-Moltbot-on-AWS-with-Bedrock"
+
+  InstanceId:
+    Description: "EC2 Instance ID (for reference)"
+    Value: !Ref MoltbotInstance
+
+  BedrockModel:
+    Description: "Bedrock model in use"
+    Value: !Ref MoltbotModel
+
+  MonthlyCost:
+    Description: "Estimated monthly cost (USD)"
+    Value: !Sub
+      - |
+        EC2 (${InstanceType}): ~$30-40
+        EBS (30GB gp3): ~$2.40
+        VPC Endpoints (4): ${VPCEndpointCost}
+        Bedrock: Pay-per-use
+        Total: ~${TotalCost}/month
+      - VPCEndpointCost: !If [CreateEndpoints, "~$30-40 ($7.30/endpoint + data)", "$0"]
+        TotalCost: !If [CreateEndpoints, "$62-75", "$32-41"]
+
